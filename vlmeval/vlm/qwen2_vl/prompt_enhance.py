@@ -1,0 +1,167 @@
+from __future__ import annotations
+
+
+class Qwen2VLPromptMixinEnhance:
+    """
+    Mixin class for Qwen2VLChat to build custom prompt for different datasets.
+
+    Requires the following methods to be implemented in the subclass:
+        - dump_image(line, dataset: str) -> str | list[str]
+
+    Implements the following methods:
+        - use_custom_prompt(dataset: str) -> bool
+        - build_prompt(line, dataset: str) -> list[dict[str, str]]
+    """
+
+    def __init__(self, *args, use_custom_prompt: bool = True, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._use_custom_prompt = use_custom_prompt
+
+    def set_dump_image(self, dump_image_func):
+        self.dump_image_func = dump_image_func
+
+    def dump_image(self, line, dataset):
+        return self.dump_image_func(line)
+    # 此处代码指的是，如果测评数据集有他自己的prompt，则返回Flase，如果没有返回True，使用默认的prompt
+    def use_custom_prompt(self, dataset: str) -> bool:
+        from vlmeval.dataset import DATASET_TYPE
+        dataset_type = DATASET_TYPE(dataset, default=None)
+
+        if not self._use_custom_prompt:
+            return False
+        if dataset in {'MMMU_DEV_VAL', 'MMMU_TEST'}:
+            return True
+        if dataset_type == 'MCQ':
+            if dataset is not None and 'LEGO' in dataset:
+                return False
+            return True
+        if dataset_type == 'Y/N' and dataset in {'HallusionBench', 'POPE'}:  # MME has it's own prompt
+            return True
+        if dataset_type == 'VQA' and dataset not in {'MMVet', 'ChartQAPro', 'ChartQAPro_CoT', 'ChartQAPro_PoT', 'ChartMuseum'}:  # noqa: E501
+            return True
+        return False
+    
+    # 如果不使用默认的prompt的话，那么在此处定义每个种类测评数据集专属的prompt
+    def build_prompt(self, line, dataset: str) -> list[dict[str, str]]:
+        from vlmeval.dataset import DATASET_TYPE
+        # 此处单独为MMMU的多图与题干结构设计prompt
+        if dataset in {'MMMU_DEV_VAL', 'MMMU_TEST'}:
+            return self._build_mmmu_prompt(line, dataset)
+        dataset_type = DATASET_TYPE(dataset, default=None)
+        # 此处单独为MCQ的多选题设计prompt(MMBench、MMBench_CN、MMStar、SEEDBench_IMG、ScienceQA_VAL)
+        if dataset_type == 'MCQ':
+            return self._build_mcq_prompt(line, dataset)
+        # 此处单独为Y/N的是非题设计prompt(POPE、HallusionBench、MME)
+        if dataset_type == 'Y/N':
+            return self._build_yorn_prompt(line, dataset)
+        # 此处单独为VQA的视觉问答题设计prompt(MMVet、ChartQAPro、ChartQAPro_CoT、ChartQAPro_PoT、ChartMuseum)
+        if dataset_type == 'VQA':
+            return self._build_vqa_prompt(line, dataset)
+        raise ValueError(f'Unsupported dataset: {dataset}')
+
+    def _build_mmmu_prompt(self, line, dataset: str) -> list[dict[str, str]]:
+        """change the prompt for MMMU dataset: keep all images at beginning."""
+
+        import string
+
+        import pandas as pd
+
+        tgt_path = self.dump_image(line, dataset)
+        question = line['question']
+        options = {cand: line[cand] for cand in string.ascii_uppercase if cand in line and not pd.isna(line[cand])}
+        options_prompt = 'Options:\n'
+        for key, item in options.items():
+            options_prompt += f'{key}. {item}\n'
+        hint = line['hint'] if ('hint' in line and not pd.isna(line['hint'])) else None
+        prompt = ''
+        if hint is not None:
+            prompt += f'Hint: {hint}\n'
+        prompt += f'Question: {question}\n'
+        if len(options):
+            prompt += options_prompt
+            prompt += 'Please select the correct answer from the options above. \n'
+        prompt = prompt.rstrip()
+        msgs = []
+        # 如果tgt_path是list，则将list中的每个元素都添加到msgs中
+        # 如果tgt_path是单个元素，则将该元素添加到msgs中
+        # 最后将prompt添加到msgs中
+        # 目的是把图都放在前面，避免图文交错式数据
+        if isinstance(tgt_path, list):
+            msgs.extend([dict(type='image', value=p) for p in tgt_path])
+        else:
+            msgs = [dict(type='image', value=tgt_path)]
+        msgs.append(dict(type='text', value=prompt))
+        return msgs
+
+    def _build_mcq_prompt(self, line, dataset: str) -> list[dict[str, str]]:
+        """change the prompt for MCQ dataset: use chinese prompt if the question contains chinese characters."""
+        MCQ_CN_PROMPT = '请直接回答选项字母。'
+        MCQ_EN_PROMPT = 'Please select the correct answer from the options above.'
+
+        import string
+
+        import pandas as pd
+        # 检测问题中是否含有中文
+        def cn_string(s):
+            import re
+
+            if re.search('[\u4e00-\u9fff]', s):
+                return True
+            return False
+
+        tgt_path = self.dump_image(line, dataset)
+        question = line['question']
+        options = {cand: line[cand] for cand in string.ascii_uppercase if cand in line and not pd.isna(line[cand])}
+        options_prompt = 'Options:\n'
+        for key, item in options.items():
+            options_prompt += f'{key}. {item}\n'
+        hint = line['hint'] if ('hint' in line and not pd.isna(line['hint'])) else None
+        prompt = ''
+        if hint is not None:
+            prompt += f'Hint: {hint}\n'
+        prompt += f'Question: {question}\n'
+        if len(options):
+            prompt += options_prompt
+            prompt += MCQ_CN_PROMPT if cn_string(prompt) else MCQ_EN_PROMPT
+        prompt = prompt.rstrip()
+        msgs = []
+        if isinstance(tgt_path, list):
+            msgs.extend([dict(type='image', value=p) for p in tgt_path])
+        else:
+            msgs = [dict(type='image', value=tgt_path)]
+        msgs.append(dict(type='text', value=prompt))
+        return msgs
+
+    # 判断题：把图片 + 问题文本 + “请回答 yes 或 no”指令打包成模型输入
+    def _build_yorn_prompt(self, line, dataset: str) -> list[dict[str, str]]:
+        """change the prompt for YORN dataset:"""
+        YORN_PROMPT = ' Please answer yes or no.'
+
+        tgt_path = self.dump_image(line, dataset)
+        question = line['question']
+        msgs = []
+        if isinstance(tgt_path, list):
+            msgs.extend([dict(type='image', value=p) for p in tgt_path])
+        else:
+            msgs = [dict(type='image', value=tgt_path)]
+        msgs.append(dict(type='text', value=question))
+        assert msgs[-1]['type'] == 'text'
+        msgs[-1]['value'] += YORN_PROMPT
+        return msgs
+        
+    # 视觉问答题：把图片 + 问题文本 + “请尝试用简短的单词或短语回答问题”指令打包成模型输入
+    def _build_vqa_prompt(self, line, dataset: str) -> list[dict[str, str]]:
+        """change the prompt for VQA dataset:"""
+        VQA_PROMPT = '\nPlease try to answer the question with short words or phrases if possible.'
+
+        tgt_path = self.dump_image(line, dataset)
+        question = line['question']
+        msgs = []
+        if isinstance(tgt_path, list):
+            msgs.extend([dict(type='image', value=p) for p in tgt_path])
+        else:
+            msgs = [dict(type='image', value=tgt_path)]
+        msgs.append(dict(type='text', value=question))
+        assert msgs[-1]['type'] == 'text'
+        msgs[-1]['value'] += VQA_PROMPT
+        return msgs
