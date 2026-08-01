@@ -316,10 +316,18 @@ class Qwen2VLChatEnhance(Qwen2VLPromptMixinEnhance, BaseModel):
         self.attention_threshold_quantile = kwargs.pop(
             'attention_threshold_quantile', two_stage_config.get('attention_threshold_quantile', 0.8)
         )
-        # 背景区域衰减系数：越小表示背景被压暗/抑制得越明显。
+        # 背景区域衰减系数：越小表示背景被压暗/抑制得越明显。（旧 mask 模式保留；现默认用 crop）
         self.mask_background_alpha = kwargs.pop(
             'mask_background_alpha', two_stage_config.get('mask_background_alpha', 0.2)
         )
+        # 视觉证据裁剪：bbox 外扩比例（相对区域宽高），避免裁得过紧。
+        self.crop_padding_ratio = float(kwargs.pop(
+            'crop_padding_ratio', two_stage_config.get('crop_padding_ratio', 0.1)
+        ))
+        # 裁剪边长下限（像素），过小区域会向外扩展到该尺寸。
+        self.crop_min_size = int(kwargs.pop(
+            'crop_min_size', two_stage_config.get('crop_min_size', 32)
+        ))
         # 是否保存注意力调试数据（中间张量/统计结果等），用于排查两阶段行为。
         self.save_attention_debug = kwargs.pop(
             'save_attention_debug', two_stage_config.get('save_attention_debug', False)
@@ -1170,77 +1178,63 @@ class Qwen2VLChatEnhance(Qwen2VLPromptMixinEnhance, BaseModel):
                 return image_path
         return None
 
-    # 功能：根据热力图生成前景增强/背景抑制的掩膜图，并返回调试信息。
+    # 功能：根据融合热力图阈值区域做 fallback crop，并返回调试信息。
     def _build_masked_image(self, image_path: str, heatmap: np.ndarray):
         from PIL import Image
 
         # 输入图路径无效时直接返回，避免后续 I/O 异常。
         if image_path is None or not os.path.exists(image_path):
             return None, {}
-        # 读取原图并转换为 float 数组，便于后续数值运算。
-        image = Image.open(image_path).convert('RGB') 
+        # 读取原图；热力图缩放到原图尺寸后按分位数阈值得到前景区域。
+        image = Image.open(image_path).convert('RGB')
         img_arr = np.array(image).astype(np.float32)
-        # 将 token/网格级热力图缩放到原图尺寸，和像素空间对齐。
+        width, height = image.size
         resized_heat = Image.fromarray((heatmap * 255).astype(np.uint8)).resize(image.size, Image.BILINEAR)
         heat = np.array(resized_heat).astype(np.float32) / 255.0
-        
-        
-        # 在此处修改二值化方法，采用otsu方法进行二值化
-        # binary = auto_otsu(min_max_scale(heat))
-        # 用分位数阈值切分前景区域：高于阈值视为高关注区域。
+
         threshold = float(np.quantile(heat, self.attention_threshold_quantile))
         binary = heat >= threshold
-        # 前景保留原图，背景按 alpha 衰减，实现“前景增强/背景抑制”。
-        masked = np.where(binary[..., None], img_arr, img_arr * float(self.mask_background_alpha))
-        masked = np.clip(masked, 0, 255).astype(np.uint8)
+        if not binary.any():
+            return None, {}
 
-   
+        bbox = self._bbox_from_mask(binary, width, height)
+        if bbox is None:
+            return None, {}
+        crop_path, debug = self._save_image_crop(
+            image_path, bbox, stem_suffix='fallback_crop'
+        )
+        if crop_path is None:
+            return None, {}
+
         # 可选保存热力图叠加图，用于人工检查注意力是否对齐目标区域。
-        # 指定输出目录：优先用配置，否则仍用临时目录
+        overlay_path = None
         output_dir = self.attention_debug_dir
-        
-        # output_dir = None # 设置不保存中间的调试图像
-        if output_dir:
-            os.makedirs(output_dir, exist_ok=True)
-            image_stem = os.path.splitext(os.path.basename(image_path))[0] or 'image'
-            masked_path = os.path.join(output_dir, f'{image_stem}_masked.png')
-            Image.fromarray(masked).save(masked_path)
-
-            overlay_path = None
-            if self.save_heatmap_overlay:
+        if self.save_heatmap_overlay:
+            overlay = self._build_heatmap_overlay(img_arr, heat)
+            if output_dir:
+                os.makedirs(output_dir, exist_ok=True)
+                image_stem = os.path.splitext(os.path.basename(image_path))[0] or 'image'
                 overlay_path = os.path.join(output_dir, f'{image_stem}_heatmap_overlay.png')
-                overlay = self._build_heatmap_overlay(img_arr, heat)
                 Image.fromarray(overlay).save(overlay_path)
-        else:
-            # 默认不保存
-            # 保持原来的临时文件逻辑,保存到tmp文件夹中
-            with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as fout:
-                Image.fromarray(masked).save(fout.name)
-                masked_path = fout.name
-
-            overlay_path = None
-            if self.save_heatmap_overlay:
+            else:
                 with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as fout:
-                    overlay = self._build_heatmap_overlay(img_arr, heat)
                     Image.fromarray(overlay).save(fout.name)
-                    overlay_path = fout.name        
+                    overlay_path = fout.name
 
-        # 汇总关键调试指标：阈值、前景占比和生成文件路径。
-        debug = {
+        debug.update({
             'mask_threshold': threshold,
             'mask_foreground_ratio': float(binary.mean()),
-            'masked_image_path': masked_path,
-        }
+            'crop_style': 'combined_fallback',
+        })
         if overlay_path is not None:
             debug['heatmap_overlay_path'] = overlay_path
         if self.save_attention_debug:
-            # 开启调试时，额外持久化归一化热力图数组（.npy）便于离线分析。
             debug_dir = self.attention_debug_dir or tempfile.mkdtemp(prefix='qwen2vl_attn_debug_')
             os.makedirs(debug_dir, exist_ok=True)
             heatmap_path = os.path.join(debug_dir, 'heatmap.npy')
             np.save(heatmap_path, heat)
             debug['heatmap_path'] = heatmap_path
-        return masked_path, debug
+        return crop_path, debug
 
     # 功能：从单个关键词热力图中仅提取“最强且面积最大”的单一连通区域，去除其余噪声。
     def _extract_dominant_region_mask(self, heat_2d: np.ndarray) -> np.ndarray:
@@ -1323,6 +1317,7 @@ class Qwen2VLChatEnhance(Qwen2VLPromptMixinEnhance, BaseModel):
         width, height = image.size
         combined = np.zeros((height, width), dtype=bool)
         per_keyword_debug = []
+        per_keyword_masks = []
 
         for item in keyword_items:
             heatmap = item.get('heatmap', None)
@@ -1333,25 +1328,111 @@ class Qwen2VLChatEnhance(Qwen2VLPromptMixinEnhance, BaseModel):
             resized = Image.fromarray(heat_uint8).resize((width, height), Image.BILINEAR)
             heat = np.array(resized).astype(np.float32) / 255.0
             region = self._extract_dominant_region_mask(heat)
+            keyword = item.get('keyword', '')
             if region.shape != (height, width) or not region.any():
                 per_keyword_debug.append({
-                    'keyword': item.get('keyword', ''),
+                    'keyword': keyword,
                     'region_area_ratio': 0.0,
                 })
                 continue
             combined |= region
+            # 与 keyword 成对保存，避免失败关键词导致索引错位。
+            per_keyword_masks.append({
+                'keyword': keyword,
+                'mask': region,
+            })
             per_keyword_debug.append({
-                'keyword': item.get('keyword', ''),
+                'keyword': keyword,
                 'region_area_ratio': float(region.mean()),
             })
 
         debug = {
             'combined_foreground_ratio': float(combined.mean()) if combined.size else 0.0,
             'per_keyword_region': per_keyword_debug,
+            # 仅供后续 Separated crop 使用，写入 last_two_stage_debug 前应弹出。
+            'per_keyword_masks': per_keyword_masks,
         }
         return combined, debug
 
-    # 功能：基于最终布尔掩码生成前景增强/背景抑制图，并返回调试信息。
+    # 功能：由布尔掩码计算带 padding / 最小边长约束的裁剪框 (x1, y1, x2, y2)。
+    def _bbox_from_mask(self, mask_bool: np.ndarray, width: int, height: int):
+        binary = np.asarray(mask_bool).astype(bool)
+        if binary.ndim != 2 or not binary.any():
+            return None
+        ys, xs = np.where(binary)
+        x1, x2 = int(xs.min()), int(xs.max()) + 1
+        y1, y2 = int(ys.min()), int(ys.max()) + 1
+
+        bw = max(1, x2 - x1)
+        bh = max(1, y2 - y1)
+        pad_ratio = max(0.0, float(self.crop_padding_ratio))
+        pad_x = max(1, int(round(bw * pad_ratio))) if pad_ratio > 0 else 0
+        pad_y = max(1, int(round(bh * pad_ratio))) if pad_ratio > 0 else 0
+        x1 = max(0, x1 - pad_x)
+        y1 = max(0, y1 - pad_y)
+        x2 = min(width, x2 + pad_x)
+        y2 = min(height, y2 + pad_y)
+
+        min_size = max(1, int(self.crop_min_size))
+        cur_w, cur_h = x2 - x1, y2 - y1
+        if cur_w < min_size:
+            expand = min_size - cur_w
+            x1 = max(0, x1 - expand // 2)
+            x2 = min(width, x1 + min_size)
+            x1 = max(0, x2 - min_size)
+        if cur_h < min_size:
+            expand = min_size - cur_h
+            y1 = max(0, y1 - expand // 2)
+            y2 = min(height, y1 + min_size)
+            y1 = max(0, y2 - min_size)
+        if x2 <= x1 or y2 <= y1:
+            return None
+        return (x1, y1, x2, y2)
+
+    # 功能：按 bbox 裁剪原图并保存，返回路径与调试信息。
+    def _save_image_crop(
+        self,
+        image_path: str,
+        bbox: tuple[int, int, int, int],
+        stem_suffix: str = 'crop',
+    ):
+        from PIL import Image
+
+        if image_path is None or not os.path.exists(image_path):
+            return None, {}
+        if bbox is None:
+            return None, {}
+
+        image = Image.open(image_path).convert('RGB')
+        width, height = image.size
+        x1, y1, x2, y2 = [int(v) for v in bbox]
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(width, x2), min(height, y2)
+        if x2 <= x1 or y2 <= y1:
+            return None, {}
+
+        cropped = image.crop((x1, y1, x2, y2))
+        output_dir = self.attention_debug_dir
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+            image_stem = os.path.splitext(os.path.basename(image_path))[0] or 'image'
+            crop_path = os.path.join(output_dir, f'{image_stem}_{stem_suffix}.png')
+            cropped.save(crop_path)
+        else:
+            with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as fout:
+                cropped.save(fout.name)
+                crop_path = fout.name
+
+        debug = {
+            'crop_bbox': [x1, y1, x2, y2],
+            'crop_size': [x2 - x1, y2 - y1],
+            'crop_image_path': crop_path,
+            'masked_image_path': crop_path,  # 兼容旧调试字段名
+            'visual_prompt_mode': 'crop',
+        }
+        return crop_path, debug
+
+    # 功能：基于布尔掩码做 Combined crop（并集区域外接框裁剪）。
     def _build_masked_image_from_mask(self, image_path: str, mask_bool: np.ndarray):
         from PIL import Image
 
@@ -1361,42 +1442,121 @@ class Qwen2VLChatEnhance(Qwen2VLPromptMixinEnhance, BaseModel):
             return None, {}
 
         image = Image.open(image_path).convert('RGB')
-        img_arr = np.array(image).astype(np.float32)
-        h, w = img_arr.shape[:2]
+        width, height = image.size
 
         binary = np.asarray(mask_bool).astype(bool)
-        # 掩码尺寸与原图不一致时，用最近邻对齐到像素空间。
-        if binary.shape != (h, w):
-            resized_mask = Image.fromarray((binary * 255).astype(np.uint8)).resize((w, h), Image.NEAREST)
+        if binary.shape != (height, width):
+            resized_mask = Image.fromarray((binary * 255).astype(np.uint8)).resize(
+                (width, height), Image.NEAREST
+            )
             binary = np.array(resized_mask) > 0
 
-        # 前景保留原图，背景按 alpha 衰减，实现“前景增强/背景抑制”。
-        masked = np.where(binary[..., None], img_arr, img_arr * float(self.mask_background_alpha))
-        masked = np.clip(masked, 0, 255).astype(np.uint8)
+        bbox = self._bbox_from_mask(binary, width, height)
+        if bbox is None:
+            return None, {}
+
+        crop_path, debug = self._save_image_crop(
+            image_path, bbox, stem_suffix='combined_crop'
+        )
+        if crop_path is None:
+            return None, {}
 
         output_dir = self.attention_debug_dir
         mask_png_path = None
         if output_dir:
             os.makedirs(output_dir, exist_ok=True)
             image_stem = os.path.splitext(os.path.basename(image_path))[0] or 'image'
-            masked_path = os.path.join(output_dir, f'{image_stem}_masked.png')
-            Image.fromarray(masked).save(masked_path)
-            # 额外保存最终并集掩码，便于检查针对性区域。
             mask_png_path = os.path.join(output_dir, f'{image_stem}_combined_mask.png')
             Image.fromarray((binary * 255).astype(np.uint8)).save(mask_png_path)
-        else:
-            with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as fout:
-                Image.fromarray(masked).save(fout.name)
-                masked_path = fout.name
 
-        debug = {
+        debug.update({
             'mask_foreground_ratio': float(binary.mean()),
-            'masked_image_path': masked_path,
-            'mask_source': 'per_keyword_dominant_region',
-        }
+            'mask_source': 'per_keyword_dominant_region_crop',
+            'crop_style': 'combined',
+        })
         if mask_png_path is not None:
             debug['combined_mask_path'] = mask_png_path
-        return masked_path, debug
+        return crop_path, debug
+
+    # 功能：Qwen-VL(Separated) — 每个关键词区域单独 crop，返回多张证据图。
+    def _build_separated_keyword_crops(
+        self,
+        image_path: str,
+        per_keyword_masks: list,
+        per_keyword_region: list | None = None,
+        fallback_heatmap: np.ndarray | None = None,
+        fallback_combined_mask: np.ndarray | None = None,
+    ):
+        from PIL import Image
+
+        if image_path is None or not os.path.exists(image_path):
+            return [], {}
+
+        image = Image.open(image_path).convert('RGB')
+        width, height = image.size
+        crop_paths = []
+        crop_items = []
+
+        for idx, item in enumerate(per_keyword_masks or []):
+            if isinstance(item, dict):
+                keyword = item.get('keyword', '')
+                mask = item.get('mask', None)
+            else:
+                # 兼容旧格式：直接传 bool mask 数组。
+                keyword = ''
+                if per_keyword_region and idx < len(per_keyword_region):
+                    keyword = per_keyword_region[idx].get('keyword', '')
+                mask = item
+            binary = np.asarray(mask).astype(bool) if mask is not None else None
+            if binary is None or not binary.any():
+                continue
+            if binary.shape != (height, width):
+                resized_mask = Image.fromarray((binary * 255).astype(np.uint8)).resize(
+                    (width, height), Image.NEAREST
+                )
+                binary = np.array(resized_mask) > 0
+            bbox = self._bbox_from_mask(binary, width, height)
+            if bbox is None:
+                continue
+            tag = self._keyword_file_tag(keyword=keyword, index=idx)
+            crop_path, crop_dbg = self._save_image_crop(
+                image_path, bbox, stem_suffix=f'{tag}_crop'
+            )
+            if crop_path is None:
+                continue
+            crop_paths.append(crop_path)
+            crop_items.append({
+                'keyword': keyword,
+                'crop_image_path': crop_path,
+                'crop_bbox': crop_dbg.get('crop_bbox'),
+            })
+
+        debug = {
+            'crop_style': 'separated',
+            'visual_prompt_mode': 'crop',
+            'num_crops': len(crop_paths),
+            'crop_items': crop_items,
+            'masked_image_path': crop_paths[0] if crop_paths else None,
+            'crop_image_paths': list(crop_paths),
+        }
+
+        if crop_paths:
+            return crop_paths, debug
+
+        # 无有效分词区域时回退：优先并集 crop，再回退融合热图 crop。
+        if fallback_combined_mask is not None and np.asarray(fallback_combined_mask).any():
+            path, fb_debug = self._build_masked_image_from_mask(image_path, fallback_combined_mask)
+            if path is not None:
+                fb_debug = dict(fb_debug or {})
+                fb_debug['crop_style'] = 'combined_fallback_from_union'
+                return [path], fb_debug
+        if fallback_heatmap is not None:
+            path, fb_debug = self._build_masked_image(image_path, fallback_heatmap)
+            if path is not None:
+                fb_debug = dict(fb_debug or {})
+                fb_debug['crop_style'] = 'combined_fallback_from_heatmap'
+                return [path], fb_debug
+        return [], debug
 
     # 功能：将热力图伪彩色叠加到原图数组上，生成可视化图像。
     def _build_heatmap_overlay(self, img_arr: np.ndarray, heat: np.ndarray) -> np.ndarray:
@@ -1630,31 +1790,43 @@ class Qwen2VLChatEnhance(Qwen2VLPromptMixinEnhance, BaseModel):
             replaced.append(copied)
         return replaced
 
-    # 功能：在原来图像的基础上添加关键对象补丁视觉提示，保持其余内容不变。
-    # 示例：原消息为 [原图, 问题文本]，调用后变为 [原图, 掩膜/补丁图, 问题文本]
-    def  _add_masked_image(self, message, new_image_path: str):
+    # 功能：在原来图像的基础上添加 crop 视觉提示，保持其余内容不变。
+    # 示例：原消息为 [原图, 问题文本]，调用后变为 [原图, crop图..., 问题文本]
+    def  _add_masked_image(self, message, new_image_path):
+        image_paths = new_image_path if isinstance(new_image_path, (list, tuple)) else [new_image_path]
+        image_paths = [p for p in image_paths if p]
         replaced = []
         prompt_inserted = False
         for item in message:
             copied = dict(item)
             replaced.append(copied)
             if not prompt_inserted and copied.get('type') == 'image':
-                replaced.append({'type': 'image', 'value': new_image_path})
+                for path in image_paths:
+                    replaced.append({'type': 'image', 'value': path})
                 prompt_inserted = True
         return replaced
 
 
-    # 功能：在原来图像的基础上添加关键对象补丁视觉提示和关键词，保持其余内容不变。
-    # 示例：原消息为 [原图, 问题文本]，调用后变为 [原图, 掩膜/补丁图, 关键词, 问题文本]
-    def  _add_masked_image_and_keywords(self, message, new_image_path: str, keywords: list[str]):
+    # 功能：在原来图像的基础上添加 crop 视觉提示和关键词，保持其余内容不变。
+    # 示例：原消息为 [原图, 问题文本]，调用后变为 [原图, crop图..., 关键词, 问题文本]
+    def  _add_masked_image_and_keywords(self, message, new_image_path, keywords: list[str]):
+        image_paths = new_image_path if isinstance(new_image_path, (list, tuple)) else [new_image_path]
+        image_paths = [p for p in image_paths if p]
         replaced = []
         prompt_inserted = False
         for item in message:
             copied = dict(item)
             replaced.append(copied)
             if not prompt_inserted and copied.get('type') == 'image':
-                replaced.append({'type': 'image', 'value': new_image_path})
-                replaced.append({'type': 'text', 'value': f"Keywords: {', '.join(keywords)}. Please analyze based on the image and the question."})
+                for path in image_paths:
+                    replaced.append({'type': 'image', 'value': path})
+                replaced.append({
+                    'type': 'text',
+                    'value': (
+                        f"Keywords: {', '.join(keywords)}. "
+                        "Please analyze based on the image and the question."
+                    ),
+                })
                 prompt_inserted = True
         return replaced
 
@@ -2406,28 +2578,33 @@ class Qwen2VLChatEnhance(Qwen2VLPromptMixinEnhance, BaseModel):
             }
             return final_response
 
-        # 逐关键词提取“最强且面积最大”的单一区域并按并集融合，得到针对性更强的掩码。
+        # Qwen-VL(Separated)：每个关键词显著区域单独 crop；失败时回退 Combined/热图 crop。
         combined_mask, region_debug = self._build_combined_keyword_mask(
             primary_image_path,
             attn_result.get('keyword_heatmap_items', []),
         )
-        if combined_mask is not None and combined_mask.any():
-            # 基于并集区域掩码生成前景增强图。
-            masked_image_path, mask_debug = self._build_masked_image_from_mask(primary_image_path, combined_mask)
-            if isinstance(mask_debug, dict):
-                mask_debug['region_meta'] = region_debug
-        else:
-            # 并集区域为空时回退旧的融合热图分位数阈值方案，保证鲁棒性。
-            print("逐关键词区域提取为空，回退融合热图阈值掩码")
-            masked_image_path, mask_debug = self._build_masked_image(primary_image_path, attn_result['heatmap'])
-        if masked_image_path is None:
-            # 掩膜图构建失败时同样回退原图推理，并保留回退标记。
-            print("掩膜图构建失败，回退原图推理")
+        per_keyword_masks = []
+        if isinstance(region_debug, dict):
+            per_keyword_masks = region_debug.pop('per_keyword_masks', []) or []
+        crop_paths, mask_debug = self._build_separated_keyword_crops(
+            primary_image_path,
+            per_keyword_masks=per_keyword_masks,
+            per_keyword_region=(
+                region_debug.get('per_keyword_region', []) if isinstance(region_debug, dict) else []
+            ),
+            fallback_heatmap=attn_result.get('heatmap'),
+            fallback_combined_mask=combined_mask,
+        )
+        if isinstance(mask_debug, dict):
+            mask_debug['region_meta'] = region_debug
+        masked_image_path = crop_paths  # 后续消息拼装支持 list
+        if not crop_paths:
+            print("separated crop 构建失败，回退原图推理")
             final_response = self._generate_inner_transformers_single(message, dataset=dataset)
             self.last_two_stage_debug = {
                 'stage1_response': stage1_response,
                 'keywords': keywords,
-                'fallback': 'mask_build_failed',
+                'fallback': 'crop_build_failed',
             }
             return final_response
 
@@ -2516,10 +2693,7 @@ class Qwen2VLChatEnhance(Qwen2VLPromptMixinEnhance, BaseModel):
                         'pseudo_overlay_path': pseudo_saved.get('pseudo_overlay_path'),
                     })
         
-        # 阶段二：将消息中的首张图替换为掩膜图，再生成最终答案。（需要排查是否需要在文本处添加keywords）
-        # 仅添加mask视觉提示
-        # stage2_message = self._add_masked_image(message, masked_image_path)
-        # 添加mask视觉提示和keywords
+        # 阶段二：原图 + Separated crops + 关键词，再生成最终答案。
         stage2_message = self._add_masked_image_and_keywords(message, masked_image_path, keywords)
         
         # 阶段二推理前清理 GPU 缓存，确保为最终生成腾出足够显存
